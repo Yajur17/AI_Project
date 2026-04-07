@@ -1,0 +1,12 @@
+{
+  "name": "yajur-ai",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.4.0",
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
+    "@ljharb/tsconfig": "^0.3.2"
+  }
+}
