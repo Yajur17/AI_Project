@@ -26,9 +26,12 @@ jobs:
       - name: Zip and upload to S3
         run: |
           zip -r deployment.zip . \
-            --exclude ".git/*" \
-            --exclude ".github/*" \
-            --exclude ".env"
+              --exclude ".git/*" \
+              --exclude ".github/*" \
+              --exclude ".env" \
+              --exclude "*.log" \
+              --exclude "*.md" \
+              --exclude "*.csv"
 
           aws s3 cp deployment.zip s3://${{ secrets.S3_BUCKET_NAME }}/deployment.zip
 
