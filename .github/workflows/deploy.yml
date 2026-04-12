@@ -13,6 +13,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: npm install --production
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -20,10 +23,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Sync to S3
+      - name: Zip and upload to S3
         run: |
-          aws s3 sync . s3://${{ secrets.S3_BUCKET_NAME }} \
+          zip -r deployment.zip . \
             --exclude ".git/*" \
-            --exclude "node_modules/*" \
-            --exclude ".env" \
-            --delete
+            --exclude ".github/*" \
+            --exclude ".env"
+
+          aws s3 cp deployment.zip s3://${{ secrets.S3_BUCKET_NAME }}/deployment.zip
+
+      - name: Update Lambda from S3
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --s3-bucket ${{ secrets.S3_BUCKET_NAME }} \
+            --s3-key deployment.zip
