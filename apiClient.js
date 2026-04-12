@@ -7,7 +7,7 @@ import { runHelloWorldChain, runResearchChain } from "./langchainChain.js";
 
 dotenv.config({ quiet: true });
 
-const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
+const LOG_LEVEL = (process.env.LOG_LEVEL).toLowerCase();
 const LOG_SUCCESS_SAMPLE_RATE = Number(process.env.LOG_SUCCESS_SAMPLE_RATE || "0.25");
 const INCLUDE_PROMPT_IN_LOGS = process.env.INCLUDE_PROMPT_IN_LOGS === "true";
 const ENABLE_FILE_LOGS =
