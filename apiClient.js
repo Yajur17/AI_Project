@@ -3,6 +3,9 @@ import OpenAI from "openai";
 import express from "express";
 import serverless from "serverless-http";
 import fs from "fs";
+import { randomUUID } from "crypto";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { runHelloWorldChain, runResearchChain } from "./langchainChain.js";
 
 dotenv.config({ quiet: true });
@@ -14,6 +17,11 @@ const ENABLE_FILE_LOGS =
   typeof process.env.ENABLE_FILE_LOGS === "string"
     ? process.env.ENABLE_FILE_LOGS === "true"
     : !process.env.AWS_LAMBDA_FUNCTION_NAME;
+const ENABLE_DDB_AUDIT =
+  typeof process.env.ENABLE_DDB_AUDIT === "string"
+    ? process.env.ENABLE_DDB_AUDIT === "true"
+    : !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+const DDB_TABLE_NAME = process.env.DDB_TABLE_NAME || "aiproject";
 
 const LOG_PRIORITY = {
   error: 0,
@@ -56,6 +64,8 @@ if (!API_KEY) {
 }
 
 const client = new OpenAI({ apiKey: API_KEY });
+const ddbClient = new DynamoDBClient({});
+const ddbDocClient = DynamoDBDocumentClient.from(ddbClient);
 
 const INPUT_RATE_PER_1K = 0.00003;
 const OUTPUT_RATE_PER_1K = 0.00006;
@@ -76,6 +86,63 @@ function logToFile(label, data) {
 
 function estimateCost(inputTokens = 0, outputTokens = 0) {
   return (inputTokens * INPUT_RATE_PER_1K + outputTokens * OUTPUT_RATE_PER_1K) / 1000;
+}
+
+function sanitizeHeaders(headers = {}) {
+  const output = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const lowerKey = key.toLowerCase();
+    if (
+      lowerKey === "authorization" ||
+      lowerKey === "x-api-key" ||
+      lowerKey === "cookie" ||
+      lowerKey === "set-cookie"
+    ) {
+      output[key] = "[redacted]";
+      continue;
+    }
+    output[key] = value;
+  }
+  return output;
+}
+
+function fitForDynamo(data) {
+  const raw = JSON.stringify(data);
+  if (Buffer.byteLength(raw, "utf8") <= 350000) {
+    return data;
+  }
+
+  return {
+    truncated: true,
+    reason: "Payload exceeded DynamoDB item size safety limit.",
+    payloadPreview: raw.slice(0, 20000),
+    payloadBytes: Buffer.byteLength(raw, "utf8"),
+  };
+}
+
+async function writeAuditRecord({ created, requestId, data }) {
+  if (!ENABLE_DDB_AUDIT) {
+    return;
+  }
+
+  try {
+    await ddbDocClient.send(
+      new PutCommand({
+        TableName: DDB_TABLE_NAME,
+        Item: {
+          created,
+          requestId,
+          data: fitForDynamo(data),
+        },
+      })
+    );
+  } catch (error) {
+    writeLog("error", "dynamodb_audit_write_failed", {
+      message: error?.message || "Unknown DynamoDB write error.",
+      tableName: DDB_TABLE_NAME,
+      requestId,
+    });
+  }
 }
 
 async function askOne({ prompt, model = "gpt-4o", temperature }) {
@@ -169,6 +236,26 @@ app.use(express.json({ limit: MAX_BODY_SIZE }));
 
 app.use((req, res, next) => {
   const startTime = Date.now();
+  const requestId = String(req.headers["x-request-id"] || randomUUID());
+  const created = new Date().toISOString();
+  res.setHeader("x-request-id", requestId);
+
+  let responseBody;
+  const originalJson = res.json.bind(res);
+  const originalSend = res.send.bind(res);
+
+  res.json = (payload) => {
+    responseBody = payload;
+    return originalJson(payload);
+  };
+
+  res.send = (payload) => {
+    if (typeof responseBody === "undefined") {
+      responseBody = payload;
+    }
+    return originalSend(payload);
+  };
+
   res.on("finish", () => {
     const latencyMs = Date.now() - startTime;
     const isError = res.statusCode >= 500;
@@ -183,6 +270,30 @@ app.use((req, res, next) => {
       path: req.originalUrl,
       statusCode: res.statusCode,
       latencyMs,
+      requestId,
+    });
+
+    writeAuditRecord({
+      created,
+      requestId,
+      data: {
+        endpoint: req.originalUrl,
+        method: req.method,
+        latencyMs,
+        statusCode: res.statusCode,
+        request: {
+          headers: sanitizeHeaders(req.headers || {}),
+          query: req.query || {},
+          params: req.params || {},
+          body: req.body,
+        },
+        response: {
+          headers: sanitizeHeaders(
+            typeof res.getHeaders === "function" ? res.getHeaders() : {}
+          ),
+          body: responseBody,
+        },
+      },
     });
   });
   next();
