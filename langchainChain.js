@@ -13,6 +13,22 @@ function estimateCost(inputTokens = 0, outputTokens = 0) {
   return (inputTokens * INPUT_RATE_PER_1K + outputTokens * OUTPUT_RATE_PER_1K) / 1000;
 }
 
+function normalizeOutlinePoints(text = "") {
+  return String(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => line.replace(/^[-*]\s+/, ""))
+    .map((line) => line.replace(/\*\*/g, ""));
+}
+
+function splitResearchParagraphs(text = "") {
+  return String(text)
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+}
+
 // ─── Shared model factory ────────────────────────────────────────────────────
 // Returns a ChatOpenAI instance with the given options.
 // Centralised here so both chain functions use the same setup.
@@ -82,10 +98,13 @@ export async function runResearchChain({ topic, model, temperature }) {
   const start = Date.now();
 
   const outlineResult = await outlineChain.invoke({ topic });
-  const outline = outlineResult.content;
+  const outlineText = outlineResult.content;
 
-  const researchResult = await expandChain.invoke({ outline });
-  const research = researchResult.content;
+  const researchResult = await expandChain.invoke({ outline: outlineText });
+  const researchText = researchResult.content;
+
+  const outline = normalizeOutlinePoints(outlineText);
+  const research = splitResearchParagraphs(researchText);
 
   const latencyMs = Date.now() - start;
 
