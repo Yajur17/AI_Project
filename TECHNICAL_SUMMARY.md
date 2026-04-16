@@ -5,7 +5,9 @@
 **Version:** 1.0.0  
 **Type:** Node.js API (Express + Serverless) deployed on AWS Lambda (ZIP)
 
-**Update Added:** April 10, 2026 (LangChain integration + new /chain endpoint)
+**Update Added:** April 10, 2026 (LangChain integration + new /chain endpoint)  
+**Update Added:** April 12, 2026 (Research response normalization + DynamoDB audit logging)  
+**Update Added:** April 15, 2026 (Structured output extraction: /prompt + /prompt/evaluate, 3 parsing strategies, dynamic schema, retry logic)
 
 ---
 
@@ -24,16 +26,18 @@ Built a lightweight, production-ready HTTP server that abstracts the OpenAI API 
 
 ## 2. Architecture & Core Endpoints
 
-### 6 RESTful Endpoints
+### 8 RESTful Endpoints
 
 | Endpoint | Method | Input | Purpose |
-|----------|--------|-------|---------|
+|----------|--------|-------|--------|
 | `/ask` | POST | `{prompt, temperature?, model?}` | Single prompt handling with optional parameters |
 | `/batch` | POST | `{prompts[], temperature?, model?}` | Parallel processing of 1-5 unique prompts |
 | `/chain` | POST | `{mode, question?, topic?, temperature?, model?}` | LangChain-powered single-step and 2-step chained workflows |
 | `/cost-estimate` | POST | `{prompt, expectedOutputTokens}` | Pre-calculation of API costs (no API call) |
 | `/models` | GET | N/A | List available OpenAI models |
 | `/health` | GET | N/A | Server status check |
+| `/prompt` | POST | `{topic, audience?, style?, parser?, schemaFields?, retries?, model?, temperature?}` | Structured output extraction with 3 parsing strategies and retry loop |
+| `/prompt/evaluate` | POST | `{tests?, schemaFields?, retries?, model?, temperature?, includeRawAttempts?}` | Reliability benchmark across all 3 strategies with ranked summary |
 
 ### Request-Response Flow
 
@@ -79,6 +83,7 @@ Added a new orchestration module `langchainChain.js` and connected it via `/chai
   - Step 1: generate 3-point outline
   - Step 2: expand outline into exactly 3 paragraphs
   - Sequential data flow: topic -> outline -> research
+  - Response normalization: `outline` as `string[]`, `research` as `string[]`
   - Aggregates token usage across both model calls
 
 Design choice: chain logic is isolated from transport logic (Express route handlers) to keep API surface stable and allow future chain evolution without endpoint rewrites.
@@ -119,7 +124,54 @@ const estimatedCost = (inputTokens * INPUT_RATE_PER_1K + outputTokens * OUTPUT_R
   - Latency measurements
   - `/chain REQUEST`, `/chain RESPONSE`, `/chain ERROR`
 
----
+### 4.4 DynamoDB Audit Persistence (April 12)
+- Added DynamoDB write path using AWS SDK v3 (`@aws-sdk/client-dynamodb`, `@aws-sdk/lib-dynamodb`)
+- Each completed HTTP request is persisted with keys:
+  - `created` (ISO timestamp)
+  - `requestId` (incoming `x-request-id` or generated UUID)
+  - `data` (endpoint, latency, request snapshot, response snapshot)
+- Header redaction is enforced before persistence:
+  - `authorization`, `x-api-key`, `cookie`, `set-cookie`
+- Item-size safety guard truncates oversized payloads to avoid DynamoDB limit failures
+- Writes are fail-safe (API response still returns even if audit write fails)
+
+### 4.5 Structured Output Extraction (April 15)
+
+Added two new endpoints — `/prompt` and `/prompt/evaluate` — to explore LLM output reliability under different parsing strategies.
+
+**Three Parsing Strategies:**
+
+| Strategy | How it works |
+|---|---|
+| `json` | Instructs the model to reply in strict JSON; parsed via LangChain `JsonOutputParser` |
+| `regex` | Instructs the model to reply as `Key: Value` lines; extracted via regex pattern matching |
+| `custom` | Hybrid — tries JSON parse first, then heuristic line parsing, then sentence-level key extraction |
+
+**Dynamic Schema Support:**
+
+The `/prompt` endpoint accepts an optional `schemaFields` array. When provided, the model is told which keys to return. When omitted, parsing falls back to generic key-value extraction (returns at least an `answer` field). This means `/prompt` handles any question — not just a fixed domain.
+
+```json
+{ "schemaFields": ["answer", "key_points"] }  // enforce specific keys
+{ "schemaFields": [] }                          // generic mode, model decides keys
+```
+
+**Retry Logic — Error Feedback Loop:**
+
+`extractStructuredWithRetries()` wraps every parse attempt. On failure, the parse error message is fed back to the LLM as context for the next attempt. This teaches the model what went wrong so it can self-correct, rather than retrying with the exact same prompt blindly. Configurable via `retries` (0–5).
+
+**Reliability Benchmark — `/prompt/evaluate`:**
+
+Runs all 3 strategies against a test set (default: built-in 10 inputs, or caller-supplied). Returns:
+- Per-strategy: `total`, `successes`, `failures`, `successRate`, `averageAttempts`
+- `ranking` array sorted by `successRate` desc, then `averageAttempts` asc
+- Every row's `parsedOutput`, `attemptsUsed`, and (optional) `rawAttempts`
+
+**What was confirmed in logs (April 15 test session):**
+- `custom` parser successfully extracted `answer` and `key_points` from the creatine question in 1 attempt
+- `json` parser returned a clean JSON `advice` field in 1 attempt
+- Retry logic validates correctly — all tested payloads resolved on attempt 1
+- `schemaFields: []` (generic mode) and `schemaFields: ["answer", "key_points"]` both work correctly
 
 ## 5. API Design Decisions
 
@@ -151,6 +203,7 @@ const estimatedCost = (inputTokens * INPUT_RATE_PER_1K + outputTokens * OUTPUT_R
 | LangChain Package | langchain | ^0.3.x |
 | Environment | dotenv | ^17.4.0 |
 | Server | express + serverless-http | ^4.x + ^3.x |
+| AWS SDK (DynamoDB) | @aws-sdk/client-dynamodb + @aws-sdk/lib-dynamodb | ^3.x |
 | Logging | `fs` module | Built-in |
 
 **Why ES Modules?** Native support for `import` syntax, better tree-shaking, aligns with modern JavaScript standards.
@@ -209,6 +262,12 @@ const estimatedCost = (inputTokens * INPUT_RATE_PER_1K + outputTokens * OUTPUT_R
 ✅ **Duplicate Detection** — Case-insensitive matching works  
 ✅ **LangChain Endpoint** — `/chain` hello and research modes execute successfully  
 ✅ **Chain Logging Parity** — `/chain` now logs request/response/error like other endpoints  
+✅ **Research JSON Normalization** — `/chain` research returns `outline[]` and `research[]`  
+✅ **DynamoDB Audit Writes** — Request/response records persisted with request IDs  
+✅ **Structured Output Extraction** — `/prompt` endpoint returns parsed output for any question using 3 strategies  
+✅ **Dynamic Schema Enforcement** — `schemaFields` param controls which keys are extracted; generic mode when omitted  
+✅ **Retry with Error Feedback** — Malformed parse errors are fed back to the LLM for self-correction (up to 5 retries)  
+✅ **Reliability Benchmark** — `/prompt/evaluate` runs all 3 strategies on ≥10 inputs and ranks by success rate  
 
 ---
 
@@ -287,7 +346,7 @@ curl http://localhost:3004/health
 ### Lambda Configuration Used
 - Runtime: `Node.js 20.x`
 - Handler: `apiClient.handler`
-- Environment variable: `OPENAI_API_KEY`
+- Environment variables: `OPENAI_API_KEY`, `DDB_TABLE_NAME`
 
 ### Packaging Command Used
 ```bash
@@ -308,22 +367,27 @@ zip -r lambda.zip apiClient.js package.json node_modules
 "I built an abstraction layer over OpenAI's API to understand cost drivers and monitor performance. The server handles validation, error handling, and provides real-time cost estimation."
 
 **Key Achievements:**
-1. Designed 6 RESTful endpoints with clear separation of concerns
+1. Designed 8 RESTful endpoints with clear separation of concerns
 2. Implemented latency tracking and cost calculation for every API call
 3. Built semantic duplicate detection for batch processing
 4. Comprehensive audit logging for cost/performance analysis
+5. Implemented 3 structured output parsing strategies (JSON, regex, custom) with retry logic and dynamic schema support
 
 **What I Learned:**
 1. Output tokens dominate costs more than input tokens (higher rate + larger volume)
 2. Temperature variations don't affect token counts, only response generation variance
 3. Proper error handling (timeouts, size limits) is non-negotiable for production APIs
+4. Feeding parse errors back to the LLM as context (retry loop) is far more effective than blind retries
+5. Dynamic schema extraction generalises LLM output parsing to any domain without hardcoding field names
 
 **Technologies Demonstrated:**
 - Node.js ES Modules and http server architecture
 - OpenAI SDK integration and error handling
+- LangChain chains, `JsonOutputParser`, and LCEL pipe composition
 - Asynchronous programming (async/await, Promise.all)
 - Request validation and security patterns
 - Logging and monitoring design
+- Structured output parsing strategies and reliability benchmarking
 
 ---
 
@@ -338,4 +402,4 @@ zip -r lambda.zip apiClient.js package.json node_modules
 
 ---
 
-**Last Updated:** April 10, 2026
+**Last Updated:** April 15, 2026
