@@ -4,7 +4,7 @@ A lightweight Node.js API server for interacting with OpenAI and LangChain chain
 
 ## What's Implemented
 
-### 6 Core Endpoints
+### 8 Core Endpoints
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -14,6 +14,8 @@ A lightweight Node.js API server for interacting with OpenAI and LangChain chain
 | `/cost-estimate` | POST | Estimate API cost before calling OpenAI |
 | `/models` | GET | List available OpenAI models |
 | `/health` | GET | Check server status |
+| `/prompt` | POST | Structured output extraction with 3 parsing strategies (json, regex, custom) and retry logic |
+| `/prompt/evaluate` | POST | Reliability benchmark — runs all 3 strategies across test inputs and ranks by success rate |
 
 ## Key Features
 
@@ -26,6 +28,11 @@ A lightweight Node.js API server for interacting with OpenAI and LangChain chain
 ✅ **Request Size Limits** — Max 1MB payload to prevent memory issues  
 ✅ **Error Handling** — Try-catch with detailed error messages  
 ✅ **Timeout Protection** — 10-second abort timeout on OpenAI requests  
+✅ **DynamoDB Audit Persistence** — Per-request audit record stored with `created`, `requestId`, and full call data  
+✅ **Research JSON Output** — `/chain` research mode returns `outline[]` and `research[]` arrays  
+✅ **Structured Output Extraction** — `/prompt` endpoint extracts structured data from any question using 3 parser strategies with automatic retry on malformed output  
+✅ **Dynamic Schema Support** — pass optional `schemaFields` to enforce specific output keys; falls back to generic key-value if omitted  
+✅ **Reliability Benchmarking** — `/prompt/evaluate` runs all 3 strategies on a test set (≥10 inputs) and returns `successRate`, `averageAttempts`, and ranked comparison  
 
 ## Setup
 
@@ -42,6 +49,12 @@ OPENAI_API_KEY=your_openai_api_key
 # optional logging controls:
 # ENABLE_FILE_LOGS=true
 # INCLUDE_PROMPT_IN_LOGS=false
+# LOG_LEVEL=info
+# LOG_SUCCESS_SAMPLE_RATE=0.25
+
+# optional DynamoDB audit controls:
+# DDB_TABLE_NAME=aiproject
+# ENABLE_DDB_AUDIT=true
 ```
 
 ## Run
@@ -59,14 +72,14 @@ The API is successfully deployed to AWS Lambda using a ZIP package and tested vi
 
 - Runtime: `Node.js 20.x`
 - Handler: `apiClient.handler`
-- Environment variable in Lambda: `OPENAI_API_KEY`
+- Environment variables in Lambda: `OPENAI_API_KEY`, `DDB_TABLE_NAME` (and optional `ENABLE_DDB_AUDIT`)
 
 ### ZIP Deployment Steps (Used)
 
 ```bash
 # from AI_Project/
 npm ci --omit=dev
-zip -r lambda.zip apiClient.js package.json node_modules
+zip -r lambda.zip apiClient.js langchainChain.js package.json node_modules
 ```
 
 Upload `lambda.zip` to Lambda and configure API Gateway HTTP API routes to your function.
@@ -79,7 +92,13 @@ If you see `Runtime.ImportModuleError: Cannot find module 'apiclient'`, set hand
 
 Lambda successfully returned:
 - `statusCode: 200`
-- JSON body containing `prompt`, `outputText`, `usage`, `estimatedCost`, and `latencyMs`
+- A Lambda proxy envelope (`statusCode`, `headers`, `body`) when invoked directly
+- JSON payload inside `body` containing endpoint response fields
+
+For `/chain` with `mode: "research"`, payload now includes:
+- `outline` as `string[]`
+- `research` as `string[]`
+- `usage`, `estimatedCost`, `latencyMs`
 
 ## API Examples
 
@@ -149,6 +168,30 @@ curl -X POST http://localhost:3004/chain \
   -d '{"mode":"research","topic":"Quantum computing","temperature":0.5,"model":"gpt-4o"}'
 ```
 
+**Research Response Shape:**
+```json
+{
+  "topic": "Quantum computing",
+  "outline": [
+    "What it is",
+    "How it differs from classical computing",
+    "Current real-world applications"
+  ],
+  "research": [
+    "Paragraph 1...",
+    "Paragraph 2...",
+    "Paragraph 3..."
+  ],
+  "usage": {
+    "inputTokens": 310,
+    "outputTokens": 420,
+    "totalTokens": 730
+  },
+  "estimatedCost": 0.0000345,
+  "latencyMs": 4800
+}
+```
+
 ## Logging
 
 All API activity logged to `api_calls.log`:
@@ -158,11 +201,24 @@ All API activity logged to `api_calls.log`:
 - OpenAI API calls (separate OPENAI REQUEST/RESPONSE entries)
 - Chain endpoint activity (`/chain REQUEST`, `/chain RESPONSE`, `/chain ERROR`)
 
+### DynamoDB Audit Logging
+
+When `ENABLE_DDB_AUDIT=true`, each request is persisted to DynamoDB table `DDB_TABLE_NAME` with:
+- `created` (ISO timestamp)
+- `requestId` (incoming `x-request-id` or generated UUID)
+- `data` object:
+  - endpoint, method, statusCode, latencyMs
+  - request (headers/query/params/body)
+  - response (headers/body)
+
+Sensitive headers are redacted: `authorization`, `x-api-key`, `cookie`, `set-cookie`.
+
 ### Logging Defaults
 
 - Local runtime: file logging is enabled by default
 - AWS Lambda runtime: file logging is disabled by default
 - Override with `ENABLE_FILE_LOGS=true` or `ENABLE_FILE_LOGS=false`
+- DynamoDB audit logging is enabled by default on Lambda (or set `ENABLE_DDB_AUDIT` explicitly)
 
 ## Error Handling
 
@@ -184,3 +240,96 @@ Update constants in `apiClient.js` to match current rates.
 - OpenAI SDK v4+
 - Express + serverless-http
 - dotenv for environment variables
+
+## Structured Output Extraction
+
+The `/prompt` endpoint supports 3 parsing strategies for any topic:
+
+- `json`: asks the model for strict JSON
+- `regex`: asks for plain key-value lines (`Field: Value`)
+- `custom`: handles natural text + key-value + JSON fallback
+
+### Optional Schema
+
+You can pass `schemaFields` to force required keys.
+
+```json
+{
+  "schemaFields": ["answer", "key_points"]
+}
+```
+
+If `schemaFields` is omitted, parsing is generic and usually returns at least an `answer` field.
+
+### Retry Logic for Malformed Output
+
+`/prompt` accepts `retries` (0 to 5). If parsing fails, the server re-prompts the model with the parse error and retries automatically.
+
+### Structured Extraction Example (General Q&A)
+
+```bash
+curl -X POST http://localhost:3004/prompt \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic": "When should I consume creatine?",
+    "audience": "gym beginner",
+    "style": "concise",
+    "parser": "custom",
+    "retries": 2,
+    "temperature": 0.7,
+    "model": "gpt-4o"
+  }'
+```
+
+### Structured Extraction With Required Fields
+
+```bash
+curl -X POST http://localhost:3004/prompt \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic": "When should I consume creatine?",
+    "audience": "gym beginner",
+    "style": "concise",
+    "parser": "json",
+    "schemaFields": ["answer", "key_points"],
+    "retries": 2
+  }'
+```
+
+### Reliability Benchmark Across 3 Strategies
+
+Use `/prompt/evaluate` to run at least 10 test inputs across `json`, `regex`, and `custom` and get success rate metrics.
+
+```bash
+curl -X POST http://localhost:3004/prompt/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schemaFields": ["answer"],
+    "retries": 2,
+    "temperature": 0.2,
+    "model": "gpt-4o"
+  }'
+```
+
+Custom test set example (must be at least 10):
+
+```bash
+curl -X POST http://localhost:3004/prompt/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tests": [
+      "When should I consume creatine?",
+      "What should I eat before a workout?",
+      "How much water should I drink daily?",
+      "How to improve squat depth?",
+      "Difference between whey isolate and concentrate?",
+      "What are signs of overtraining?",
+      "How much protein do beginners need?",
+      "Can I train abs every day?",
+      "Best warm-up for leg day?",
+      "Should cardio be before or after weights?"
+    ],
+    "schemaFields": ["answer"],
+    "retries": 2
+  }'
+```
