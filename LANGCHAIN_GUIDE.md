@@ -308,8 +308,16 @@ The `catch` block catches it, logs with `writeLog("error", "chain_error", ...)`,
 ```json
 {
   "topic": "Quantum computing",
-  "outline": "• What it is\n• How it differs from classical computing\n• Current real-world applications",
-  "research": "Quantum computing is a paradigm... [paragraph 1]\n\nUnlike classical computers... [paragraph 2]\n\nToday, companies like IBM... [paragraph 3]",
+  "outline": [
+    "What it is",
+    "How it differs from classical computing",
+    "Current real-world applications"
+  ],
+  "research": [
+    "Quantum computing is a paradigm... [paragraph 1]",
+    "Unlike classical computers... [paragraph 2]",
+    "Today, companies like IBM... [paragraph 3]"
+  ],
   "usage": {
     "inputTokens": 310,
     "outputTokens": 420,
@@ -319,6 +327,10 @@ The `catch` block catches it, logs with `writeLog("error", "chain_error", ...)`,
   "latencyMs": 4800
 }
 ```
+
+Current implementation normalizes research output for API readability:
+- `outline` is returned as an array of cleaned bullet points.
+- `research` is returned as an array of paragraphs.
 
 Notice how `latencyMs` is roughly 4x higher for research mode. That's two sequential API calls. This is the cost of the decomposition pattern — you pay in latency to gain structure quality.
 
@@ -362,3 +374,54 @@ Notice how `latencyMs` is roughly 4x higher for research mode. That's two sequen
 4. **Swap the model**: Change `buildLLM` to use `gpt-4o-mini` for the outline step and `gpt-4o` for the expansion step. More cost-efficient — cheap model structures, expensive model writes.
 
 5. **Explore `StringOutputParser`**: Add `.pipe(new StringOutputParser())` to one chain and see what you lose (token metadata). That trade-off is always present: simplicity vs observability.
+
+---
+
+## 9. LangChain in the `/prompt` Endpoint (Structured Output Extraction)
+
+The `/prompt` endpoint was added on April 15. It uses LangChain in one of its three parsing strategies.
+
+### The `json` strategy — `JsonOutputParser`
+
+```js
+import { JsonOutputParser } from "@langchain/core/output_parsers";
+
+const parser = new JsonOutputParser();
+const parsed = await parser.invoke(rawText);
+```
+
+`JsonOutputParser` does two things the raw `JSON.parse()` doesn't:
+1. **Markdown fence stripping** — the model often wraps JSON in triple-backtick fences (` ```json ... ``` `). `JsonOutputParser` strips the fence before parsing.
+2. **LangChain-compatible output** — it returns a plain JS object, compatible with LCEL chains if you add it to a pipeline later.
+
+For the other two strategies (`regex` and `custom`), standard JavaScript handles the parsing — no LangChain is needed because those strategies don't expect strict JSON output from the model.
+
+### Why `JsonOutputParser` and not a custom function?
+
+The alternative is `extractJsonSnippet()`, which is a custom helper in `apiClient.js` that also strips fences before calling `JSON.parse()`. That function exists as a fallback for cases where `JsonOutputParser` isn't available.
+
+Using `JsonOutputParser` as the primary path means the project leverages a tested, community-maintained utility rather than maintaining its own fence-stripping regex.
+
+### The three `/prompt` strategies summarised
+
+| Strategy | LangChain involved | Parse approach |
+|---|---|---|
+| `json` | Yes — `JsonOutputParser` | Model outputs JSON → parser strips fences + parses |
+| `regex` | No | Model outputs `Key: Value` lines → regex extracts pairs |
+| `custom` | No | Model outputs free text → tries JSON, then line heuristics, then sentence patterns |
+
+### Dynamic Schema — what the model is told
+
+For all three strategies, `getExtractionInstructionByStrategy(strategy, schemaFields)` builds the system instruction. When `schemaFields` is non-empty (e.g. `["answer", "key_points"]`), the instruction explicitly names those fields. When empty, the model is told to extract whatever key-value structure it sees in the text.
+
+This is a prompt-engineering pattern, not a LangChain feature — but it directly controls what the LangChain-parsed (or regex-parsed, or custom-parsed) output contains.
+
+### Retry loop — error feedback
+
+When parsing fails, `extractStructuredWithRetries()` formats the error message into the next prompt:
+
+```js
+const nextPrompt = getStructuredPrompt({ instruction, sourceTask, previousError: parseError.message });
+```
+
+The model receives its previous failure reason as context before its next attempt. This is a manual prompt-chaining pattern (not a LangChain `RunnableWithMessageHistory`). It's simpler and sufficient for a retry count of 0–5.
