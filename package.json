@@ -17,6 +17,7 @@
     "dotenv": "^17.4.0",
     "serverless": "^3.40.0"
   },
+  
   "scripts": {
     "start": "node apiClient.js",
     "deploy": "serverless deploy"
