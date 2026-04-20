@@ -1,6 +1,3 @@
-import dotenv from "dotenv";
-dotenv.config({ quiet: true });
-
 import { ChatOpenAI } from "@langchain/openai";
 import { PromptTemplate } from "@langchain/core/prompts";
 
