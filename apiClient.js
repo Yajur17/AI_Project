@@ -636,8 +636,46 @@ app.use((req, res, next) => {
   const originalJson = res.json.bind(res);
   const originalSend = res.send.bind(res);
 
-  res.json = (payload) => {
+  res.json = async (payload) => {
     responseBody = payload;
+    const latencyMs = Date.now() - startTime;
+    const isError = (res.statusCode || 200) >= 500;
+    const shouldSampleSuccess = Math.random() < LOG_SUCCESS_SAMPLE_RATE;
+
+    // Await audit write BEFORE sending response so Lambda doesn't freeze mid-write
+    await writeAuditRecord({
+      created,
+      requestId,
+      data: {
+        endpoint: req.originalUrl,
+        method: req.method,
+        latencyMs,
+        statusCode: res.statusCode || 200,
+        request: {
+          headers: sanitizeHeaders(req.headers || {}),
+          query: req.query || {},
+          params: req.params || {},
+          body: req.body,
+        },
+        response: {
+          headers: sanitizeHeaders(
+            typeof res.getHeaders === "function" ? res.getHeaders() : {}
+          ),
+          body: payload,
+        },
+      },
+    });
+
+    if (isError || shouldSampleSuccess || LOG_LEVEL === "debug") {
+      writeLog(isError ? "error" : "info", "http_request", {
+        method: req.method,
+        path: req.originalUrl,
+        statusCode: res.statusCode || 200,
+        latencyMs,
+        requestId,
+      });
+    }
+
     return originalJson(payload);
   };
 
@@ -647,46 +685,6 @@ app.use((req, res, next) => {
     }
     return originalSend(payload);
   };
-
-  res.on("finish", () => {
-    const latencyMs = Date.now() - startTime;
-    const isError = res.statusCode >= 500;
-    const shouldSampleSuccess = Math.random() < LOG_SUCCESS_SAMPLE_RATE;
-
-    const auditData = {
-      endpoint: req.originalUrl,
-      method: req.method,
-      latencyMs,
-      statusCode: res.statusCode,
-      request: {
-        headers: sanitizeHeaders(req.headers || {}),
-        query: req.query || {},
-        params: req.params || {},
-        body: req.body,
-      },
-      response: {
-        headers: sanitizeHeaders(
-          typeof res.getHeaders === "function" ? res.getHeaders() : {}
-        ),
-        body: responseBody,
-      },
-    };
-
-    // Always write audit record regardless of log sampling
-    writeAuditRecord({ created, requestId, data: auditData });
-
-    if (!isError && !shouldSampleSuccess && LOG_LEVEL !== "debug") {
-      return;
-    }
-
-    writeLog(isError ? "error" : "info", "http_request", {
-      method: req.method,
-      path: req.originalUrl,
-      statusCode: res.statusCode,
-      latencyMs,
-      requestId,
-    });
-  });
   next();
 });
 
