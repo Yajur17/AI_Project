@@ -1,4 +1,3 @@
-import dotenv from "dotenv";
 import OpenAI from "openai";
 import express from "express";
 import serverless from "serverless-http";
@@ -11,7 +10,14 @@ import { PromptTemplate } from "@langchain/core/prompts";
 import { JsonOutputParser, StringOutputParser } from "@langchain/core/output_parsers";
 import { runHelloWorldChain, runResearchChain } from "./langchainChain.js";
 
-dotenv.config({ quiet: true });
+if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  try {
+    const dotenv = await import("dotenv");
+    dotenv.default.config({ quiet: true });
+  } catch {
+    console.warn("dotenv not available (expected in Lambda)");
+  }
+}
 
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 const LOG_SUCCESS_SAMPLE_RATE = Number(process.env.LOG_SUCCESS_SAMPLE_RATE || "0.25");
