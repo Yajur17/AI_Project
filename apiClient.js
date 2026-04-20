@@ -14,8 +14,8 @@ if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
   try {
     const dotenv = await import("dotenv");
     dotenv.default.config({ quiet: true });
-  } catch {
-    console.warn("dotenv not available (expected in Lambda)");
+  } catch (err) {
+    console.warn("dotenv not available (expected in Lambda):", err.message);
   }
 }
 
@@ -73,8 +73,23 @@ if (!API_KEY) {
 }
 
 const client = new OpenAI({ apiKey: API_KEY });
-const ddbClient = new DynamoDBClient({});
-const ddbDocClient = DynamoDBDocumentClient.from(ddbClient);
+
+let ddbDocClient = null;
+function getDdbDocClient() {
+  if (!ddbDocClient) {
+    try {
+      const ddbClient = new DynamoDBClient({});
+      ddbDocClient = DynamoDBDocumentClient.from(ddbClient);
+    } catch (error) {
+      writeLog("warn", "dynamodb_init_failed", {
+        message: error?.message || "Could not initialize DynamoDB client.",
+        context: "Will skip audit logging.",
+      });
+      return null;
+    }
+  }
+  return ddbDocClient;
+}
 
 const INPUT_RATE_PER_1K = 0.00003;
 const OUTPUT_RATE_PER_1K = 0.00006;
@@ -134,8 +149,13 @@ async function writeAuditRecord({ created, requestId, data }) {
     return;
   }
 
+  const docClient = getDdbDocClient();
+  if (!docClient) {
+    return;
+  }
+
   try {
-    await ddbDocClient.send(
+    await docClient.send(
       new PutCommand({
         TableName: DDB_TABLE_NAME,
         Item: {
