@@ -2,6 +2,8 @@ import OpenAI from "openai";
 import express from "express";
 import serverless from "serverless-http";
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
@@ -9,6 +11,8 @@ import { ChatOpenAI } from "@langchain/openai";
 import { PromptTemplate } from "@langchain/core/prompts";
 import { JsonOutputParser, StringOutputParser } from "@langchain/core/output_parsers";
 import { runHelloWorldChain, runResearchChain } from "./langchainChain.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
   try {
@@ -94,6 +98,10 @@ function getDdbDocClient() {
 const INPUT_RATE_PER_1K = 0.00003;
 const OUTPUT_RATE_PER_1K = 0.00006;
 const MAX_BODY_SIZE = "1mb";
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "*")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 const LOG_PATH = process.env.AWS_LAMBDA_FUNCTION_NAME
   ? "/tmp/api_calls.log"
@@ -624,7 +632,37 @@ function messageContentToText(content) {
 }
 
 const app = express();
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowAnyOrigin = FRONTEND_ORIGINS.includes("*");
+  const isAllowedOrigin = allowAnyOrigin || (origin && FRONTEND_ORIGINS.includes(origin));
+
+  if (allowAnyOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (isAllowedOrigin && origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type,Authorization,X-Request-Id,X-Api-Key"
+  );
+
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+
+  next();
+});
 app.use(express.json({ limit: MAX_BODY_SIZE }));
+
+// Serve static frontend — only in local dev (not in Lambda)
+if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  app.use(express.static(path.join(__dirname, "frontend")));
+}
 
 app.use((req, res, next) => {
   const startTime = Date.now();
