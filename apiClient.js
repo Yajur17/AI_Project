@@ -202,7 +202,7 @@ async function writeAuditRecord({ created, requestId, data }) {
   }
 }
 
-async function writeChatRecord({ userId, userName, created, data }) {
+async function writeChatRecord({ userId, userName, created, lastChatted, data }) {
   if (!ENABLE_DDB_AUDIT) {
     return;
   }
@@ -220,6 +220,7 @@ async function writeChatRecord({ userId, userName, created, data }) {
           userId,
           userName,
           created,
+          lastChatted,
           data: fitForDynamo(data),
         },
       })
@@ -777,10 +778,14 @@ function serializeChatMessages(messages = []) {
   }));
 }
 
-function buildConversationSession({ userId, userName, messages = [] }) {
+function buildConversationSession({ userId, userName, created, lastChatted, messages = [] }) {
+  const createdValue = typeof created === "string" && created.trim() ? created : new Date().toISOString();
   return {
     userId: isValidUserId(userId) ? userId.trim() : randomUUID(),
     userName: normalizeUserName(userName),
+    created: createdValue,
+    lastChatted:
+      typeof lastChatted === "string" && lastChatted.trim() ? lastChatted : createdValue,
     memory: buildConversationMemory(messages),
   };
 }
@@ -806,6 +811,8 @@ function restoreConversationSession(userName, storedValue) {
   return buildConversationSession({
     userId: storedValue?.userId,
     userName: normalizedUserName,
+    created: storedValue?.created,
+    lastChatted: storedValue?.lastChatted,
     messages: restoredMessages,
   });
 }
@@ -850,6 +857,8 @@ async function persistConversationMemoryStore() {
     payload[userName] = {
       userId: session.userId,
       userName: session.userName,
+      created: session.created,
+      lastChatted: session.lastChatted,
       conversation: serializeChatMessages(await session.memory.chatHistory.getMessages()),
     };
   }
@@ -870,6 +879,8 @@ async function getConversationSession(userName) {
     session = restoreConversationSession(normalizedUserName, {
       userId: latestChat.userId,
       userName: latestChat.userName,
+      created: latestChat.created,
+      lastChatted: latestChat.lastChatted,
       conversation: latestChat.data?.conversation,
     });
     conversationSessions.set(normalizedUserName, session);
@@ -1080,24 +1091,32 @@ app.post("/talk", async (req, res) => {
     const inputTokens = result.usage_metadata?.input_tokens ?? 0;
     const outputTokens = result.usage_metadata?.output_tokens ?? 0;
     const totalTokens = result.usage_metadata?.total_tokens ?? inputTokens + outputTokens;
-    const created = new Date().toISOString();
+    const lastChatted = new Date().toISOString();
+    session.lastChatted = lastChatted;
 
     await writeChatRecord({
       userId: session.userId,
       userName: session.userName,
-      created,
+      created: session.created,
+      lastChatted,
       data: {
         prompt,
         outputText,
         conversation,
         usage: { inputTokens, outputTokens, totalTokens },
         latencyMs,
+        created: session.created,
+        lastChatted,
       },
     });
+
+    await persistConversationMemoryStore();
 
     const responsePayload = {
       userId: session.userId,
       userName: session.userName,
+      created: session.created,
+      lastChatted,
       outputText,
       conversation,
       usage: { inputTokens, outputTokens, totalTokens },
@@ -1136,6 +1155,8 @@ app.post("/talk/session", async (req, res) => {
     res.status(200).json({
       userId: session.userId,
       userName: session.userName,
+      created: session.created,
+      lastChatted: session.lastChatted,
       conversation,
       existingChat: conversation.length > 0,
     });
