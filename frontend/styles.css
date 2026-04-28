@@ -106,6 +106,98 @@ h2 {
   padding: 1rem;
 }
 
+.chat-shell {
+  display: grid;
+  grid-template-columns: 1.2fr 1.8fr;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  background:
+    radial-gradient(circle at top left, rgba(241, 127, 104, 0.16), transparent 30%),
+    linear-gradient(180deg, rgba(255, 250, 241, 0.96), rgba(255, 247, 233, 0.96));
+}
+
+.compact {
+  max-width: 34rem;
+}
+
+.chat-auth-row {
+  align-items: stretch;
+}
+
+.chat-auth-row input {
+  flex: 1;
+}
+
+.chat-auth-row .btn {
+  min-width: 9.5rem;
+}
+
+.chat-stage {
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-transcript {
+  min-height: 340px;
+  max-height: 520px;
+  overflow: auto;
+  padding: 0.85rem;
+  border-radius: 14px;
+  border: 1px solid rgba(131, 112, 84, 0.18);
+  background:
+    linear-gradient(180deg, rgba(255, 253, 247, 0.98), rgba(248, 241, 227, 0.9));
+  display: grid;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.chat-empty {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  text-align: center;
+  padding: 2rem 1rem;
+}
+
+.chat-bubble {
+  max-width: min(80%, 34rem);
+  border-radius: 16px;
+  padding: 0.8rem 0.9rem;
+  box-shadow: 0 10px 24px rgba(37, 31, 20, 0.08);
+}
+
+.chat-bubble.user {
+  margin-left: auto;
+  background: linear-gradient(130deg, #d84a38, #f17f68);
+  color: #fff7ef;
+  border-bottom-right-radius: 5px;
+}
+
+.chat-bubble.assistant {
+  margin-right: auto;
+  background: linear-gradient(130deg, #ffffff, #f4ead7);
+  color: var(--ink);
+  border: 1px solid rgba(131, 112, 84, 0.16);
+  border-bottom-left-radius: 5px;
+}
+
+.chat-role {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.3rem;
+  opacity: 0.8;
+}
+
+.chat-text {
+  margin: 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: 2fr 3fr;
@@ -280,6 +372,7 @@ textarea {
 }
 
 @media (max-width: 960px) {
+  .chat-shell,
   .workspace {
     grid-template-columns: 1fr;
   }
