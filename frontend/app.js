@@ -1,5 +1,26 @@
 const ENDPOINTS = [
   {
+    key: "talkSession",
+    label: "POST /talk/session",
+    method: "POST",
+    path: "/talk/session",
+    sampleBody: {
+      userName: "yajur",
+    },
+  },
+  {
+    key: "talk",
+    label: "POST /talk",
+    method: "POST",
+    path: "/talk",
+    sampleBody: {
+      userName: "yajur",
+      prompt: "Continue our chat.",
+      model: "gpt-4o",
+      temperature: 0.7,
+    },
+  },
+  {
     key: "health",
     label: "GET /health",
     method: "GET",
@@ -118,9 +139,22 @@ const state = {
   baseUrl: "",
   selected: ENDPOINTS[0],
   history: [],
+  chat: {
+    userId: "",
+    userName: "",
+    conversation: [],
+  },
 };
 
 const els = {
+  chatUserName: document.getElementById("chatUserName"),
+  openChatSession: document.getElementById("openChatSession"),
+  chatSessionMeta: document.getElementById("chatSessionMeta"),
+  chatTranscript: document.getElementById("chatTranscript"),
+  chatPrompt: document.getElementById("chatPrompt"),
+  sendChatMessage: document.getElementById("sendChatMessage"),
+  clearChatView: document.getElementById("clearChatView"),
+  chatStatus: document.getElementById("chatStatus"),
   endpointSelect: document.getElementById("endpointSelect"),
   requestBody: document.getElementById("requestBody"),
   loadSample: document.getElementById("loadSample"),
@@ -137,6 +171,10 @@ const els = {
 
 function normalizeBaseUrl(url) {
   return String(url || "").trim().replace(/\/+$/, "");
+}
+
+function normalizeUserName(userName) {
+  return String(userName || "").trim().toLowerCase();
 }
 
 function getConfiguredDefaultBaseUrl() {
@@ -207,6 +245,172 @@ function renderHistory() {
         `<li><strong>${entry.method} ${entry.path}</strong> · ${entry.status} · ${entry.duration} ms</li>`
     )
     .join("");
+}
+
+function setChatStatus(text, tone = "neutral") {
+  els.chatStatus.textContent = text;
+  els.chatStatus.style.color =
+    tone === "error" ? "#9f291d" : tone === "success" ? "#145f42" : "#556264";
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderChatMeta() {
+  if (!state.chat.userName) {
+    els.chatSessionMeta.textContent = "No active session.";
+    return;
+  }
+
+  const messageCount = Array.isArray(state.chat.conversation) ? state.chat.conversation.length : 0;
+  els.chatSessionMeta.textContent = `username: ${state.chat.userName} · userId: ${state.chat.userId} · messages: ${messageCount}`;
+}
+
+function renderChatConversation() {
+  const conversation = Array.isArray(state.chat.conversation) ? state.chat.conversation : [];
+
+  if (conversation.length === 0) {
+    els.chatTranscript.innerHTML =
+      '<div class="chat-empty">No messages yet. Send the first message to start this chat.</div>';
+    return;
+  }
+
+  els.chatTranscript.innerHTML = conversation
+    .map((message) => {
+      const isUser = message.role === "human";
+      return `
+        <article class="chat-bubble ${isUser ? "user" : "assistant"}">
+          <span class="chat-role">${isUser ? "You" : "Assistant"}</span>
+          <p class="chat-text">${escapeHtml(message.content || "")}</p>
+        </article>
+      `;
+    })
+    .join("");
+
+  els.chatTranscript.scrollTop = els.chatTranscript.scrollHeight;
+}
+
+async function requestJson(path, options = {}) {
+  const response = await fetch(`${normalizeBaseUrl(state.baseUrl)}${path}`, options);
+  const text = await response.text();
+
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { raw: text };
+  }
+
+  if (!response.ok) {
+    const message = payload?.error || `Request failed with status ${response.status}.`;
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+async function openChatSession() {
+  const userName = normalizeUserName(els.chatUserName.value);
+  if (!userName) {
+    setChatStatus("Username is required.", "error");
+    return;
+  }
+
+  els.openChatSession.disabled = true;
+  setChatStatus("Loading chat session...");
+
+  try {
+    const payload = await requestJson("/talk/session", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ userName }),
+    });
+
+    state.chat = {
+      userId: payload.userId || "",
+      userName: payload.userName || userName,
+      conversation: Array.isArray(payload.conversation) ? payload.conversation : [],
+    };
+
+    els.chatUserName.value = state.chat.userName;
+    renderChatMeta();
+    renderChatConversation();
+    setChatStatus(payload.existingChat ? "Existing chat loaded." : "New chat ready.", "success");
+  } catch (error) {
+    setChatStatus(error.message || "Failed to load chat session.", "error");
+  } finally {
+    els.openChatSession.disabled = false;
+  }
+}
+
+async function sendChatMessage() {
+  const userName = normalizeUserName(els.chatUserName.value);
+  const prompt = els.chatPrompt.value.trim();
+
+  if (!userName) {
+    setChatStatus("Username is required.", "error");
+    return;
+  }
+
+  if (!prompt) {
+    setChatStatus("Message cannot be empty.", "error");
+    return;
+  }
+
+  els.sendChatMessage.disabled = true;
+  setChatStatus("Sending message...");
+
+  try {
+    const payload = await requestJson("/talk", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        userName,
+        prompt,
+        model: "gpt-4o",
+        temperature: 0.7,
+      }),
+    });
+
+    state.chat = {
+      userId: payload.userId || "",
+      userName: payload.userName || userName,
+      conversation: Array.isArray(payload.conversation) ? payload.conversation : [],
+    };
+
+    els.chatUserName.value = state.chat.userName;
+    els.chatPrompt.value = "";
+    renderChatMeta();
+    renderChatConversation();
+    setChatStatus("Message sent.", "success");
+  } catch (error) {
+    setChatStatus(error.message || "Failed to send message.", "error");
+  } finally {
+    els.sendChatMessage.disabled = false;
+  }
+}
+
+function clearChatView() {
+  state.chat = {
+    userId: "",
+    userName: "",
+    conversation: [],
+  };
+  els.chatUserName.value = "";
+  els.chatPrompt.value = "";
+  renderChatMeta();
+  renderChatConversation();
+  setChatStatus("Chat view cleared.");
 }
 
 function getRequestBody() {
@@ -301,6 +505,15 @@ function initBaseUrl() {
 }
 
 function attachEvents() {
+  els.openChatSession.addEventListener("click", openChatSession);
+  els.sendChatMessage.addEventListener("click", sendChatMessage);
+  els.clearChatView.addEventListener("click", clearChatView);
+  els.chatPrompt.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      sendChatMessage();
+    }
+  });
+
   els.endpointSelect.addEventListener("change", (event) => {
     state.selected = getEndpointByKey(event.target.value);
     renderSelectedEndpoint();
@@ -318,6 +531,8 @@ function init() {
   els.endpointSelect.value = state.selected.key;
   renderSelectedEndpoint();
   clearResponse();
+  renderChatMeta();
+  renderChatConversation();
   renderHistory();
   attachEvents();
 }
