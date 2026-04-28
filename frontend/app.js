@@ -527,7 +527,7 @@ function attachEvents() {
 function init() {
   populateEndpointSelect();
   initBaseUrl();
-  state.selected = ENDPOINTS[0];
+  state.selected = getEndpointByKey("talk");
   els.endpointSelect.value = state.selected.key;
   renderSelectedEndpoint();
   clearResponse();
