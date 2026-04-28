@@ -6,10 +6,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage, AIMessage } from "@langchain/core/messages";
 import { PromptTemplate } from "@langchain/core/prompts";
 import { JsonOutputParser, StringOutputParser } from "@langchain/core/output_parsers";
+import { BufferMemory as ConversationBufferMemory, ChatMessageHistory } from "langchain/memory";
 import { runHelloWorldChain, runResearchChain } from "./langchainChain.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +37,9 @@ const ENABLE_DDB_AUDIT =
     ? process.env.ENABLE_DDB_AUDIT === "true"
     : !!process.env.AWS_LAMBDA_FUNCTION_NAME;
 const DDB_TABLE_NAME = process.env.DDB_TABLE_NAME || "aiproject";
+const CHAT_DDB_TABLE_NAME = process.env.CHAT_DDB_TABLE_NAME || "aiproject_chat";
+const CHAT_USERNAME_INDEX_NAME =
+  process.env.CHAT_USERNAME_INDEX_NAME || "UserNameCreatedIndex";
 
 const LOG_PRIORITY = {
   error: 0,
@@ -106,6 +111,9 @@ const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "*")
 const LOG_PATH = process.env.AWS_LAMBDA_FUNCTION_NAME
   ? "/tmp/api_calls.log"
   : "api_calls.log";
+const CHAT_MEMORY_PATH = process.env.AWS_LAMBDA_FUNCTION_NAME
+  ? "/tmp/chat-memory.json"
+  : path.join(__dirname, "chat-memory.json");
 
 function logToFile(label, data) {
   if (!ENABLE_FILE_LOGS) {
@@ -136,6 +144,18 @@ function sanitizeHeaders(headers = {}) {
     output[key] = value;
   }
   return output;
+}
+
+function isValidUserId(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizeUserName(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isValidUserName(value) {
+  return normalizeUserName(value).length > 0;
 }
 
 function fitForDynamo(data) {
@@ -179,6 +199,98 @@ async function writeAuditRecord({ created, requestId, data }) {
       tableName: DDB_TABLE_NAME,
       requestId,
     });
+  }
+}
+
+async function writeChatRecord({ userId, userName, created, data }) {
+  if (!ENABLE_DDB_AUDIT) {
+    return;
+  }
+
+  const docClient = getDdbDocClient();
+  if (!docClient) {
+    return;
+  }
+
+  try {
+    await docClient.send(
+      new PutCommand({
+        TableName: CHAT_DDB_TABLE_NAME,
+        Item: {
+          userId,
+          userName,
+          created,
+          data: fitForDynamo(data),
+        },
+      })
+    );
+  } catch (error) {
+    writeLog("error", "dynamodb_chat_write_failed", {
+      message: error?.message || "Unknown DynamoDB write error.",
+      tableName: CHAT_DDB_TABLE_NAME,
+      userId,
+    });
+  }
+}
+
+async function findLatestChatByUserName(userName) {
+  const normalizedUserName = normalizeUserName(userName);
+  if (!normalizedUserName) {
+    return null;
+  }
+
+  const docClient = getDdbDocClient();
+  if (!docClient) {
+    return null;
+  }
+
+  try {
+    const response = await docClient.send(
+      new QueryCommand({
+        TableName: CHAT_DDB_TABLE_NAME,
+        IndexName: CHAT_USERNAME_INDEX_NAME,
+        KeyConditionExpression: "userName = :userName",
+        ExpressionAttributeValues: {
+          ":userName": normalizedUserName,
+        },
+        ScanIndexForward: false,
+        Limit: 1,
+      })
+    );
+
+    return response.Items?.[0] || null;
+  } catch (error) {
+    if (error?.message?.includes("does not have the specified index")) {
+      try {
+        const fallbackResponse = await docClient.send(
+          new ScanCommand({
+            TableName: CHAT_DDB_TABLE_NAME,
+            FilterExpression: "userName = :userName",
+            ExpressionAttributeValues: {
+              ":userName": normalizedUserName,
+            },
+          })
+        );
+
+        return (fallbackResponse.Items || [])
+          .sort((left, right) => String(right.created || "").localeCompare(String(left.created || "")))[0] || null;
+      } catch (fallbackError) {
+        writeLog("error", "dynamodb_chat_lookup_fallback_failed", {
+          message: fallbackError?.message || "Unknown DynamoDB scan error.",
+          tableName: CHAT_DDB_TABLE_NAME,
+          userName: normalizedUserName,
+        });
+        return null;
+      }
+    }
+
+    writeLog("error", "dynamodb_chat_lookup_failed", {
+      message: error?.message || "Unknown DynamoDB query error.",
+      tableName: CHAT_DDB_TABLE_NAME,
+      indexName: CHAT_USERNAME_INDEX_NAME,
+      userName: normalizedUserName,
+    });
+    return null;
   }
 }
 
@@ -631,6 +743,148 @@ function messageContentToText(content) {
   return String(content ?? "");
 }
 
+function buildConversationMemory(messages = []) {
+  return new ConversationBufferMemory({
+    memoryKey: "chat_history",
+    inputKey: "input",
+    outputKey: "output",
+    humanPrefix: "User",
+    aiPrefix: "Assistant",
+    chatHistory: new ChatMessageHistory(messages),
+  });
+}
+
+function restoreStoredChatMessage(message) {
+  if (!message || typeof message.content !== "string") {
+    return null;
+  }
+
+  if (message.role === "ai") {
+    return new AIMessage(message.content);
+  }
+
+  if (message.role === "human") {
+    return new HumanMessage(message.content);
+  }
+
+  return null;
+}
+
+function serializeChatMessages(messages = []) {
+  return messages.map((message) => ({
+    role: typeof message._getType === "function" ? message._getType() : "unknown",
+    content: messageContentToText(message.content),
+  }));
+}
+
+function buildConversationSession({ userId, userName, messages = [] }) {
+  return {
+    userId: isValidUserId(userId) ? userId.trim() : randomUUID(),
+    userName: normalizeUserName(userName),
+    memory: buildConversationMemory(messages),
+  };
+}
+
+function getStoredConversationRecords(storedValue) {
+  if (Array.isArray(storedValue)) {
+    return storedValue;
+  }
+
+  if (storedValue && typeof storedValue === "object" && Array.isArray(storedValue.conversation)) {
+    return storedValue.conversation;
+  }
+
+  return [];
+}
+
+function restoreConversationSession(userName, storedValue) {
+  const normalizedUserName = normalizeUserName(userName || storedValue?.userName);
+  const restoredMessages = getStoredConversationRecords(storedValue)
+    .map(restoreStoredChatMessage)
+    .filter(Boolean);
+
+  return buildConversationSession({
+    userId: storedValue?.userId,
+    userName: normalizedUserName,
+    messages: restoredMessages,
+  });
+}
+
+const conversationSessions = new Map();
+
+function loadConversationMemoryStore() {
+  if (!fs.existsSync(CHAT_MEMORY_PATH)) {
+    return;
+  }
+
+  try {
+    const raw = fs.readFileSync(CHAT_MEMORY_PATH, "utf8");
+    if (!raw.trim()) {
+      return;
+    }
+
+    const parsed = JSON.parse(raw);
+    for (const [userName, storedValue] of Object.entries(parsed)) {
+      const normalizedUserName = normalizeUserName(userName || storedValue?.userName);
+      if (!normalizedUserName) {
+        continue;
+      }
+
+      conversationSessions.set(
+        normalizedUserName,
+        restoreConversationSession(normalizedUserName, storedValue)
+      );
+    }
+  } catch (error) {
+    writeLog("error", "chat_memory_load_failed", {
+      message: error?.message || "Could not load chat memory file.",
+      path: CHAT_MEMORY_PATH,
+    });
+  }
+}
+
+async function persistConversationMemoryStore() {
+  const payload = {};
+
+  for (const [userName, session] of conversationSessions.entries()) {
+    payload[userName] = {
+      userId: session.userId,
+      userName: session.userName,
+      conversation: serializeChatMessages(await session.memory.chatHistory.getMessages()),
+    };
+  }
+
+  fs.writeFileSync(CHAT_MEMORY_PATH, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+async function getConversationSession(userName) {
+  const normalizedUserName = normalizeUserName(userName);
+  let session = conversationSessions.get(normalizedUserName);
+
+  if (session) {
+    return session;
+  }
+
+  const latestChat = await findLatestChatByUserName(normalizedUserName);
+  if (latestChat) {
+    session = restoreConversationSession(normalizedUserName, {
+      userId: latestChat.userId,
+      userName: latestChat.userName,
+      conversation: latestChat.data?.conversation,
+    });
+    conversationSessions.set(normalizedUserName, session);
+    await persistConversationMemoryStore();
+    return session;
+  }
+
+  session = buildConversationSession({ userName: normalizedUserName });
+  conversationSessions.set(normalizedUserName, session);
+  await persistConversationMemoryStore();
+  return session;
+}
+
+loadConversationMemoryStore();
+
 const app = express();
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -756,6 +1010,139 @@ app.post("/ask", async (req, res) => {
   } catch (error) {
     writeLog("error", "ask_error", { message: error.message || "Internal server error." });
     logToFile("/ask ERROR", { error: error.message || "Internal server error." });
+    res.status(500).json({ error: error.message || "Internal server error." });
+  }
+});
+
+app.post("/talk", async (req, res) => {
+  try {
+    const { userName, prompt, temperature, model } = req.body ?? {};
+
+    logToFile("/talk REQUEST", {
+      userName: normalizeUserName(userName),
+      prompt: INCLUDE_PROMPT_IN_LOGS ? prompt : "[redacted]",
+      temperature,
+      model,
+    });
+
+    if (!isValidUserName(userName)) {
+      res.status(400).json({ error: "`userName` must be a non-empty string." });
+      return;
+    }
+
+    if (!isValidPrompt(prompt)) {
+      res.status(400).json({ error: "`prompt` must be a non-empty string." });
+      return;
+    }
+
+    if (!isValidTemperature(temperature)) {
+      res.status(400).json({ error: "`temperature` must be a number when provided." });
+      return;
+    }
+
+    if (!isValidModel(model)) {
+      res.status(400).json({ error: "`model` must be a string when provided." });
+      return;
+    }
+
+    const normalizedUserName = normalizeUserName(userName);
+    const session = await getConversationSession(normalizedUserName);
+    const memoryVariables = await session.memory.loadMemoryVariables({});
+    const chatHistory = String(memoryVariables.chat_history || "");
+
+    const llm = new ChatOpenAI({
+      apiKey: API_KEY,
+      model: model || "gpt-4o",
+      ...(typeof temperature === "number" ? { temperature } : {}),
+    });
+
+    const talkPrompt = PromptTemplate.fromTemplate(
+      "You are a helpful assistant in an ongoing conversation. " +
+        "Use prior context when it matters, otherwise answer directly.\n\n" +
+        "Conversation so far:\n{chat_history}\n" +
+        "User: {input}\n" +
+        "Assistant:"
+    );
+
+    const chain = talkPrompt.pipe(llm);
+    const startTime = Date.now();
+    const result = await chain.invoke({
+      chat_history: chatHistory || "No previous conversation.",
+      input: prompt,
+    });
+    const latencyMs = Date.now() - startTime;
+
+    const outputText = messageContentToText(result.content);
+    await session.memory.saveContext({ input: prompt }, { output: outputText });
+    await persistConversationMemoryStore();
+
+    const conversation = serializeChatMessages(await session.memory.chatHistory.getMessages());
+    const inputTokens = result.usage_metadata?.input_tokens ?? 0;
+    const outputTokens = result.usage_metadata?.output_tokens ?? 0;
+    const totalTokens = result.usage_metadata?.total_tokens ?? inputTokens + outputTokens;
+    const created = new Date().toISOString();
+
+    await writeChatRecord({
+      userId: session.userId,
+      userName: session.userName,
+      created,
+      data: {
+        prompt,
+        outputText,
+        conversation,
+        usage: { inputTokens, outputTokens, totalTokens },
+        latencyMs,
+      },
+    });
+
+    const responsePayload = {
+      userId: session.userId,
+      userName: session.userName,
+      outputText,
+      conversation,
+      usage: { inputTokens, outputTokens, totalTokens },
+      estimatedCost: estimateCost(inputTokens, outputTokens),
+      latencyMs,
+    };
+
+    logToFile("/talk RESPONSE", {
+      userId: session.userId,
+      userName: session.userName,
+      messageCount: conversation.length,
+      usage: responsePayload.usage,
+      latencyMs,
+    });
+
+    res.status(200).json(responsePayload);
+  } catch (error) {
+    writeLog("error", "talk_error", { message: error.message || "Internal server error." });
+    logToFile("/talk ERROR", { error: error.message || "Internal server error." });
+    res.status(500).json({ error: error.message || "Internal server error." });
+  }
+});
+
+app.post("/talk/session", async (req, res) => {
+  try {
+    const { userName } = req.body ?? {};
+
+    if (!isValidUserName(userName)) {
+      res.status(400).json({ error: "`userName` must be a non-empty string." });
+      return;
+    }
+
+    const session = await getConversationSession(userName);
+    const conversation = serializeChatMessages(await session.memory.chatHistory.getMessages());
+
+    res.status(200).json({
+      userId: session.userId,
+      userName: session.userName,
+      conversation,
+      existingChat: conversation.length > 0,
+    });
+  } catch (error) {
+    writeLog("error", "talk_session_error", {
+      message: error.message || "Internal server error.",
+    });
     res.status(500).json({ error: error.message || "Internal server error." });
   }
 });
